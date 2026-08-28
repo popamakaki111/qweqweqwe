@@ -1273,6 +1273,12 @@ def admin_menu(chat_id):
             callback_data="admin_stats"
         )
     )
+    markup.add(
+        types.InlineKeyboardButton(
+            "📢 Рассылка",
+            callback_data="admin_broadcast"
+        )
+    )
 
     bot.send_message(
         chat_id,
@@ -1281,6 +1287,257 @@ def admin_menu(chat_id):
         reply_markup=markup
     )
 
+# ============================================================
+# ADMIN BROADCAST
+# ============================================================
+
+@bot.callback_query_handler(
+    func=lambda call: call.data == "admin_broadcast"
+)
+def admin_broadcast(call):
+
+    if not is_admin(call.from_user.id):
+
+        bot.answer_callback_query(
+            call.id,
+            "❌ Доступ запрещён.",
+            show_alert=True
+        )
+
+        return
+
+    bot.answer_callback_query(call.id)
+
+    msg = bot.send_message(
+        call.message.chat.id,
+        (
+            "📢 <b>Рассылка</b>\n\n"
+            "Введите ID пользователя для отправки одному человеку "
+            "или напишите <code>ALL</code> для рассылки всем пользователям.\n\n"
+            "Пример:\n"
+            "<code>6043107587</code>\n\n"
+            "Или:\n"
+            "<code>ALL</code>"
+        ),
+        parse_mode="HTML"
+    )
+
+    bot.register_next_step_handler(
+        msg,
+        process_broadcast_recipient
+    )
+
+
+def process_broadcast_recipient(message):
+
+    if not is_admin(message.from_user.id):
+        return
+
+    if not message.text:
+
+        msg = bot.send_message(
+            message.chat.id,
+            (
+                "❌ Некорректный ввод.\n\n"
+                "Введите ID пользователя или <code>ALL</code>."
+            ),
+            parse_mode="HTML"
+        )
+
+        bot.register_next_step_handler(
+            msg,
+            process_broadcast_recipient
+        )
+
+        return
+
+    recipient = message.text.strip()
+
+    if recipient.upper() == "ALL":
+
+        target = "all"
+
+    else:
+
+        try:
+            target = int(recipient)
+
+        except ValueError:
+
+            msg = bot.send_message(
+                message.chat.id,
+                (
+                    "❌ Некорректный ID.\n\n"
+                    "Введите числовой ID пользователя "
+                    "или <code>ALL</code>."
+                ),
+                parse_mode="HTML"
+            )
+
+            bot.register_next_step_handler(
+                msg,
+                process_broadcast_recipient
+            )
+
+            return
+
+    msg = bot.send_message(
+        message.chat.id,
+        (
+            "✉️ <b>Введите сообщение</b>\n\n"
+            "Отправьте текст, который необходимо передать пользователю."
+        ),
+        parse_mode="HTML"
+    )
+
+    bot.register_next_step_handler(
+        msg,
+        process_broadcast_message,
+        target
+    )
+
+
+def process_broadcast_message(message, target):
+
+    if not is_admin(message.from_user.id):
+        return
+
+    if not message.text:
+
+        bot.send_message(
+            message.chat.id,
+            "❌ Сообщение не может быть пустым."
+        )
+
+        return
+
+    broadcast_text = message.text
+
+    # ========================================================
+    # ОТПРАВКА ОДНОМУ ПОЛЬЗОВАТЕЛЮ
+    # ========================================================
+
+    if target != "all":
+
+        try:
+
+            # Проверяем наличие пользователя в базе
+            conn = get_db()
+            cur = conn.cursor()
+
+            cur.execute(
+                "SELECT id FROM users WHERE id = ?",
+                (target,)
+            )
+
+            user = cur.fetchone()
+
+            conn.close()
+
+            if not user:
+
+                bot.send_message(
+                    message.chat.id,
+                    (
+                        "❌ Пользователь с ID "
+                        f"<code>{target}</code> не найден в базе."
+                    ),
+                    parse_mode="HTML"
+                )
+
+                return
+
+            bot.send_message(
+                target,
+                broadcast_text
+            )
+
+            bot.send_message(
+                message.chat.id,
+                (
+                    "✅ <b>Сообщение отправлено</b>\n\n"
+                    f"🆔 Пользователь: <code>{target}</code>"
+                ),
+                parse_mode="HTML"
+            )
+
+        except Exception as e:
+
+            print(
+                f"Ошибка отправки пользователю {target}:",
+                e
+            )
+
+            bot.send_message(
+                message.chat.id,
+                (
+                    "❌ Не удалось отправить сообщение "
+                    f"пользователю <code>{target}</code>."
+                ),
+                parse_mode="HTML"
+            )
+
+        return
+
+    # ========================================================
+    # РАССЫЛКА ВСЕМ ПОЛЬЗОВАТЕЛЯМ
+    # ========================================================
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT id FROM users ORDER BY id ASC"
+    )
+
+    users = cur.fetchall()
+
+    conn.close()
+
+    if not users:
+
+        bot.send_message(
+            message.chat.id,
+            "❌ В базе данных нет пользователей."
+        )
+
+        return
+
+    success = 0
+    failed = 0
+
+    for user in users:
+
+        user_id = user["id"]
+
+        try:
+
+            bot.send_message(
+                user_id,
+                broadcast_text
+            )
+
+            success += 1
+
+        except Exception as e:
+
+            failed += 1
+
+            print(
+                f"Ошибка рассылки пользователю {user_id}:",
+                e
+            )
+
+    bot.send_message(
+        message.chat.id,
+        (
+            "📢 <b>Рассылка завершена!</b>\n\n"
+            f"👥 Всего пользователей: <b>{len(users)}</b>\n"
+            f"✅ Успешно отправлено: <b>{success}</b>\n"
+            f"❌ Не удалось отправить: <b>{failed}</b>"
+        ),
+        parse_mode="HTML"
+    )
 
 # ============================================================
 # ADD PRODUCT
