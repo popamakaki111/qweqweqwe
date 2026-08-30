@@ -51,19 +51,15 @@ CRYPTO_API_URL = "https://pay.crypt.bot/api"
 # PATHS
 # ============================================================
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Railway:
+# Если подключить Railway Volume, укажи mount path /data.
+# По умолчанию база будет храниться в /data/tabler.db.
+# Путь можно изменить переменной окружения DATABASE_PATH.
+DB_NAME = os.getenv("DATABASE_PATH", "/data/tabler.db")
 
-DATA_DIR = os.path.join(
-    BASE_DIR,
-    "data"
-)
-
-os.makedirs(DATA_DIR, exist_ok=True)
-
-DB_NAME = os.path.join(
-    DATA_DIR,
-    "tabler.db"
-)
+# На случай локального запуска или отсутствия /data
+# создаём каталог автоматически.
+os.makedirs(os.path.dirname(DB_NAME), exist_ok=True)
 
 
 # ============================================================
@@ -87,7 +83,7 @@ withdrawal_states = set()
 def get_db():
     """
     Создаёт соединение с SQLite.
-    База автоматически создаётся в ./data/tabler.db
+    База автоматически создаётся по пути DATABASE_PATH (по умолчанию /data/tabler.db)
     """
     conn = sqlite3.connect(
         DB_NAME,
@@ -1902,7 +1898,7 @@ def create_invoice(amount):
 
     headers = {
         "Crypto-Pay-API-Token":
-            CRYPTO_PAY_TOKEN
+            '626975:AAHcB3lBYupqGUO5duUonVBLuDzzb5oITAJ'
     }
 
     data = {
