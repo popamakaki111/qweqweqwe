@@ -10,8 +10,8 @@ from telebot import types
 # НАСТРОЙКИ
 # ============================================================
 
-BOT_TOKEN = '8880021634:AAG1LMSMsax5XRFFHzgaeLIgJlXrMEoWc6s'
-CRYPTO_PAY_TOKEN = '626975:AAHcB3lBYupqGUO5duUonVBLuDzzb5oITAJ'
+BOT_TOKEN = "8880021634:AAG1LMSMsax5XRFFHzgaeLIgJlXrMEoWc6s"
+CRYPTO_PAY_TOKEN = "626975:AAHcB3lBYupqGUO5duUonVBLuDzzb5oITAJ"
 
 ADMIN_IDS = {
     6043107587
@@ -19,6 +19,8 @@ ADMIN_IDS = {
 
 SUPPORT_USERNAME = "nomerzad"
 REFERRAL_PERCENT = 10.0
+MIN_REFERRAL_WITHDRAWAL = 1.0
+withdrawal_states = set()
 
 DB_NAME = "/app/data/tabler.db"
 
@@ -49,7 +51,8 @@ def init_db():
             name TEXT,
             balance REAL DEFAULT 0,
             referrer_id INTEGER DEFAULT NULL,
-            referral_earnings REAL DEFAULT 0
+            referral_earnings REAL DEFAULT 0,
+            referral_balance REAL DEFAULT 0
         )
     """)
 
@@ -74,6 +77,23 @@ def init_db():
             ALTER TABLE users
             ADD COLUMN referral_earnings REAL DEFAULT 0
         """)
+
+    if "referral_balance" not in columns:
+        cur.execute("""
+            ALTER TABLE users
+            ADD COLUMN referral_balance REAL DEFAULT 0
+        """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS referral_withdrawals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            amount REAL NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            transfer_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
 
     # PAYMENTS
     cur.execute("""
@@ -797,7 +817,7 @@ def buy_product(call):
             if referral_reward > 0:
                 cur.execute("""
                     UPDATE users
-                    SET balance = balance + ?,
+                    SET referral_balance = referral_balance + ?,
                         referral_earnings = referral_earnings + ?
                     WHERE id = ?
                 """, (referral_reward, referral_reward, referrer_id))
@@ -988,42 +1008,295 @@ def referral_callback(call):
     conn = get_db()
     cur = conn.cursor()
 
-    cur.execute("SELECT COUNT(*) AS count FROM users WHERE referrer_id = ?", (user_id,))
+    cur.execute(
+        "SELECT COUNT(*) AS count FROM users WHERE referrer_id = ?",
+        (user_id,)
+    )
     referrals_count = cur.fetchone()["count"]
 
-    cur.execute("SELECT referral_earnings, balance FROM users WHERE id = ?", (user_id,))
+    cur.execute("""
+        SELECT referral_earnings, balance, referral_balance
+        FROM users
+        WHERE id = ?
+    """, (user_id,))
+
     row = cur.fetchone()
+
     referral_earnings = float(row["referral_earnings"] or 0) if row else 0.0
     balance = float(row["balance"] or 0) if row else 0.0
+    referral_balance = float(row["referral_balance"] or 0) if row else 0.0
+
     conn.close()
 
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton(
-        "📤 Пригласить друга",
-        url=(
-            "https://t.me/share/url"
-            f"?url={referral_link}"
-            "&text=Присоединяйся к магазину!"
+    markup = types.InlineKeyboardMarkup(row_width=1)
+
+    markup.add(
+        types.InlineKeyboardButton(
+            "📤 Пригласить друга",
+            url=(
+                "https://t.me/share/url"
+                f"?url={referral_link}"
+                "&text=Присоединяйся к магазину!"
+            )
         )
-    ))
-    markup.add(types.InlineKeyboardButton("◀️ Назад", callback_data="main_menu"))
+    )
+
+    markup.add(
+        types.InlineKeyboardButton(
+            "💸 Вывести реферальные",
+            callback_data="referral_withdraw"
+        )
+    )
+
+    markup.add(
+        types.InlineKeyboardButton(
+            "◀️ Назад",
+            callback_data="main_menu"
+        )
+    )
 
     bot.edit_message_text(
         chat_id=call.message.chat.id,
         message_id=call.message.message_id,
         text=(
             "👪 <b>Реферальная программа</b>\n\n"
-            f"💎 Вы получаете <b>{REFERRAL_PERCENT:.0f}%</b> с каждой покупки приглашённого пользователя.\n\n"
+            f"💎 Процент: <b>{REFERRAL_PERCENT:.0f}%</b>\n"
+            f"👥 Приглашено: <b>{referrals_count}</b>\n"
+            f"💰 Заработано всего: <b>{referral_earnings:.2f} USDT</b>\n"
+            f"💸 Доступно для вывода: <b>{referral_balance:.2f} USDT</b>\n\n"
             "🔗 <b>Ваша реферальная ссылка:</b>\n"
             f"<code>{referral_link}</code>\n\n"
-            f"👥 Приглашено: <b>{referrals_count}</b>\n"
-            f"💰 Заработано: <b>{referral_earnings:.2f} USDT</b>\n"
-            f"💵 Текущий баланс: <b>{balance:.2f} USDT</b>\n\n"
-            "📌 Отправьте ссылку другу. Реферал закрепляется за вами один раз и навсегда."
+            "📌 Реферал закрепляется за вами один раз и навсегда.\n"
+            "💵 Выводятся только деньги, заработанные по реферальной программе."
         ),
         parse_mode="HTML",
         reply_markup=markup
     )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data == "referral_withdraw"
+)
+def referral_withdraw_callback(call):
+
+    user_id = call.from_user.id
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT referral_balance FROM users WHERE id = ?",
+        (user_id,)
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    available = float(row["referral_balance"] or 0) if row else 0.0
+
+    if available < MIN_REFERRAL_WITHDRAWAL:
+        bot.answer_callback_query(
+            call.id,
+            f"❌ Минимум: {MIN_REFERRAL_WITHDRAWAL:.2f} USDT",
+            show_alert=True
+        )
+        return
+
+    withdrawal_states.add(user_id)
+    bot.answer_callback_query(call.id)
+
+    bot.send_message(
+        call.message.chat.id,
+        (
+            "💸 <b>Вывод реферальных денег</b>\n\n"
+            f"Доступно: <b>{available:.2f} USDT</b>\n"
+            f"Минимум: <b>{MIN_REFERRAL_WITHDRAWAL:.2f} USDT</b>\n\n"
+            "Введите сумму, например: <code>5.50</code>\n"
+            "Для отмены напишите: <b>отмена</b>"
+        ),
+        parse_mode="HTML"
+    )
+
+
+@bot.message_handler(
+    func=lambda message: message.from_user.id in withdrawal_states
+)
+def referral_withdraw_amount(message):
+
+    user_id = message.from_user.id
+    value = (message.text or "").strip()
+
+    if value.lower() in ("отмена", "cancel", "/cancel"):
+        withdrawal_states.discard(user_id)
+        bot.send_message(message.chat.id, "❌ Вывод отменён.")
+        return
+
+    try:
+        amount = round(float(value.replace(",", ".")), 2)
+    except ValueError:
+        bot.send_message(
+            message.chat.id,
+            "❌ Введите корректную сумму, например: <code>5.50</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    if amount < MIN_REFERRAL_WITHDRAWAL:
+        bot.send_message(
+            message.chat.id,
+            f"❌ Минимальная сумма: {MIN_REFERRAL_WITHDRAWAL:.2f} USDT"
+        )
+        return
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute(
+            "SELECT referral_balance FROM users WHERE id = ?",
+            (user_id,)
+        )
+        row = cur.fetchone()
+
+        if not row:
+            conn.rollback()
+            withdrawal_states.discard(user_id)
+            bot.send_message(message.chat.id, "❌ Пользователь не найден.")
+            return
+
+        available = float(row["referral_balance"] or 0)
+
+        if amount > available + 1e-9:
+            conn.rollback()
+            bot.send_message(
+                message.chat.id,
+                f"❌ Недостаточно. Доступно: <b>{available:.2f} USDT</b>",
+                parse_mode="HTML"
+            )
+            return
+
+        cur.execute("""
+            UPDATE users
+            SET referral_balance = referral_balance - ?
+            WHERE id = ? AND referral_balance >= ?
+        """, (amount, user_id, amount))
+
+        if cur.rowcount != 1:
+            conn.rollback()
+            bot.send_message(message.chat.id, "❌ Не удалось зарезервировать сумму.")
+            return
+
+        cur.execute("""
+            INSERT INTO referral_withdrawals (user_id, amount, status)
+            VALUES (?, ?, 'pending')
+        """, (user_id, amount))
+
+        withdrawal_id = cur.lastrowid
+        conn.commit()
+
+    except Exception as e:
+        conn.rollback()
+        print("Ошибка создания вывода:", e)
+        withdrawal_states.discard(user_id)
+        bot.send_message(message.chat.id, "❌ Ошибка при создании заявки.")
+        return
+    finally:
+        conn.close()
+
+    withdrawal_states.discard(user_id)
+
+    headers = {
+        "Crypto-Pay-API-Token": CRYPTO_PAY_TOKEN
+    }
+
+    transfer_data = {
+        "user_id": user_id,
+        "asset": "USDT",
+        "amount": f"{amount:.2f}",
+        "spend_id": f"ref_withdraw_{withdrawal_id}",
+        "comment": "Реферальный вывод"
+    }
+
+    try:
+        response = requests.post(
+            CRYPTO_API_URL + "/transfer",
+            headers=headers,
+            json=transfer_data,
+            timeout=20
+        )
+        result = response.json()
+        print("Crypto Pay transfer:", result)
+
+        if result.get("ok"):
+            transfer = result.get("result") or {}
+            transfer_id = transfer.get("transfer_id")
+
+            conn = get_db()
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE referral_withdrawals
+                SET status = 'success', transfer_id = ?
+                WHERE id = ?
+            """, (transfer_id, withdrawal_id))
+            conn.commit()
+            conn.close()
+
+            bot.send_message(
+                message.chat.id,
+                (
+                    "✅ <b>Вывод выполнен!</b>\n\n"
+                    f"💸 Сумма: <b>{amount:.2f} USDT</b>\n"
+                    f"🧾 Заявка: <code>#{withdrawal_id}</code>"
+                ),
+                parse_mode="HTML"
+            )
+        else:
+            error = result.get("error", {})
+            error_name = error.get("name", "Ошибка Crypto Pay") if isinstance(error, dict) else str(error)
+
+            conn = get_db()
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE users SET referral_balance = referral_balance + ? WHERE id = ?",
+                (amount, user_id)
+            )
+            cur.execute(
+                "UPDATE referral_withdrawals SET status = 'failed' WHERE id = ?",
+                (withdrawal_id,)
+            )
+            conn.commit()
+            conn.close()
+
+            bot.send_message(
+                message.chat.id,
+                (
+                    "❌ <b>Вывод не выполнен.</b>\n\n"
+                    f"Причина: <code>{error_name}</code>\n"
+                    "💰 Деньги возвращены на реферальный баланс."
+                ),
+                parse_mode="HTML"
+            )
+
+    except Exception as e:
+        print("Ошибка Crypto Pay transfer:", e)
+
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE users SET referral_balance = referral_balance + ? WHERE id = ?",
+            (amount, user_id)
+        )
+        cur.execute(
+            "UPDATE referral_withdrawals SET status = 'failed' WHERE id = ?",
+            (withdrawal_id,)
+        )
+        conn.commit()
+        conn.close()
+
+        bot.send_message(
+            message.chat.id,
+            "❌ Не удалось выполнить вывод. Деньги возвращены на реферальный баланс."
+        )
 
 
 # ============================================================
