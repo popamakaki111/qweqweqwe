@@ -1714,6 +1714,30 @@ def referral_withdraw_amount(message):
     # CRYPTO PAY TRANSFER
     # ========================================================
 
+    if not CRYPTO_PAY_TOKEN:
+        print("Ошибка вывода: CRYPTO_PAY_TOKEN не задан")
+        conn = get_db()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE users
+                SET referral_balance = referral_balance + ?
+                WHERE id = ?
+            """, (amount, user_id))
+            cur.execute("""
+                UPDATE referral_withdrawals
+                SET status = 'failed'
+                WHERE id = ?
+            """, (withdrawal_id,))
+            conn.commit()
+        finally:
+            conn.close()
+        bot.send_message(
+            message.chat.id,
+            "❌ Вывод недоступен: не задан CRYPTO_PAY_TOKEN. Деньги возвращены на реферальный баланс."
+        )
+        return
+
     headers = {
         "Crypto-Pay-API-Token":
             '626975:AAHcB3lBYupqGUO5duUonVBLuDzzb5oITAJ'
@@ -4648,8 +4672,11 @@ def admin_stats(call):
 
         report = create_database_report()
 
+        report_dir = os.path.dirname(DB_NAME) or "."
+        os.makedirs(report_dir, exist_ok=True)
+
         file_path = os.path.join(
-            DATA_DIR,
+            report_dir,
             "database_report.txt"
         )
 
