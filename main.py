@@ -10,7 +10,7 @@ from telebot import types
 # НАСТРОЙКИ
 # ============================================================
 
-BOT_TOKEN = '8880021634:AAG1LMSMsax5XRFFHzgaeLIgJlXrMEoWc6s'
+BOT_TOKEN = '880021634:AAG1LMSMsax5XRFFHzgaeLIgJlXrMEoWc6s'
 CRYPTO_PAY_TOKEN = '626975:AAHcB3lBYupqGUO5duUonVBLuDzzb5oITAJ'
 
 ADMIN_IDS = {
