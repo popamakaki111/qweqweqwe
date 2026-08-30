@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import requests
 import telebot
@@ -9,14 +10,15 @@ from telebot import types
 # НАСТРОЙКИ
 # ============================================================
 
-BOT_TOKEN = "8880021634:AAG1LMSMsax5XRFFHzgaeLIgJlXrMEoWc6s"
-CRYPTO_PAY_TOKEN = "626975:AAHcB3lBYupqGUO5duUonVBLuDzzb5oITAJ"
+BOT_TOKEN = '8880021634:AAG1LMSMsax5XRFFHzgaeLIgJlXrMEoWc6s'
+CRYPTO_PAY_TOKEN = '626975:AAHcB3lBYupqGUO5duUonVBLuDzzb5oITAJ'
 
 ADMIN_IDS = {
     6043107587
 }
 
 SUPPORT_USERNAME = "nomerzad"
+REFERRAL_PERCENT = 10.0
 
 DB_NAME = "/app/data/tabler.db"
 
@@ -30,7 +32,7 @@ bot = telebot.TeleBot(BOT_TOKEN)
 # ============================================================
 
 def get_db():
-    conn = sqlite3.connect('tabler.db')
+    conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -45,7 +47,9 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY,
             name TEXT,
-            balance REAL DEFAULT 0
+            balance REAL DEFAULT 0,
+            referrer_id INTEGER DEFAULT NULL,
+            referral_earnings REAL DEFAULT 0
         )
     """)
 
@@ -57,6 +61,18 @@ def init_db():
         cur.execute("""
             ALTER TABLE users
             ADD COLUMN balance REAL DEFAULT 0
+        """)
+
+    if "referrer_id" not in columns:
+        cur.execute("""
+            ALTER TABLE users
+            ADD COLUMN referrer_id INTEGER DEFAULT NULL
+        """)
+
+    if "referral_earnings" not in columns:
+        cur.execute("""
+            ALTER TABLE users
+            ADD COLUMN referral_earnings REAL DEFAULT 0
         """)
 
     # PAYMENTS
@@ -146,6 +162,37 @@ def add_user(user_id, name):
     conn.close()
 
 
+def set_referrer(user_id, referrer_id):
+    """Привязывает пользователя к рефереру только один раз."""
+    if user_id == referrer_id:
+        return False
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT id FROM users WHERE id = ?", (referrer_id,))
+    if not cur.fetchone():
+        conn.close()
+        return False
+
+    cur.execute("SELECT referrer_id FROM users WHERE id = ?", (user_id,))
+    user = cur.fetchone()
+    if not user or user["referrer_id"] is not None:
+        conn.close()
+        return False
+
+    cur.execute("""
+        UPDATE users
+        SET referrer_id = ?
+        WHERE id = ? AND referrer_id IS NULL
+    """, (referrer_id, user_id))
+
+    success = cur.rowcount == 1
+    conn.commit()
+    conn.close()
+    return success
+
+
 def get_balance(user_id):
 
     conn = get_db()
@@ -206,8 +253,19 @@ def main_menu_markup():
 
     markup.add(
         types.InlineKeyboardButton(
+            "⭐ Репутация",
+            url="https://t.me/+6rE5mjK1_sZmZDky"
+        ),
+        types.InlineKeyboardButton(
             "🆘 Поддержка",
             url=f"https://t.me/{SUPPORT_USERNAME}"
+        )
+    )
+
+    markup.add(
+        types.InlineKeyboardButton(
+            "👪 Реферальная программа",
+            callback_data="referral"
         )
     )
 
@@ -238,19 +296,44 @@ def send_main_menu(chat_id):
 @bot.message_handler(commands=["start"])
 def start(message):
 
-    add_user(
-        message.from_user.id,
-        message.from_user.first_name
-    )
+    user_id = message.from_user.id
+    name = message.from_user.first_name
+
+    add_user(user_id, name)
+
+    # Реферальный параметр: /start ref_123456
+    args = message.text.split(maxsplit=1)
+
+    if len(args) > 1:
+        referral_code = args[1].strip()
+
+        if referral_code.startswith("ref_"):
+            try:
+                referrer_id = int(referral_code[4:])
+
+                if set_referrer(user_id, referrer_id):
+                    try:
+                        bot.send_message(
+                            referrer_id,
+                            (
+                                "🎉 <b>Новый реферал!</b>\n\n"
+                                f"👤 Пользователь: <b>{name}</b>\n"
+                                f"🆔 ID: <code>{user_id}</code>\n\n"
+                                f"Теперь вы получаете <b>{REFERRAL_PERCENT:.0f}%</b> "
+                                "с его покупок."
+                            ),
+                            parse_mode="HTML"
+                        )
+                    except Exception as e:
+                        print("Ошибка уведомления реферера:", e)
+            except ValueError:
+                pass
 
     markup = types.ReplyKeyboardMarkup(
         resize_keyboard=True,
         one_time_keyboard=True
     )
-
-    markup.add(
-        types.KeyboardButton("🚀 Начать")
-    )
+    markup.add(types.KeyboardButton("🚀 Начать"))
 
     bot.send_message(
         message.chat.id,
@@ -700,6 +783,35 @@ def buy_product(call):
             content
         ))
 
+        # Реферальное вознаграждение
+        referrer_id = None
+        referral_reward = 0.0
+
+        cur.execute("SELECT referrer_id FROM users WHERE id = ?", (user_id,))
+        referral_user = cur.fetchone()
+
+        if referral_user and referral_user["referrer_id"]:
+            referrer_id = referral_user["referrer_id"]
+            referral_reward = round(price * REFERRAL_PERCENT / 100, 2)
+
+            if referral_reward > 0:
+                cur.execute("""
+                    UPDATE users
+                    SET balance = balance + ?,
+                        referral_earnings = referral_earnings + ?
+                    WHERE id = ?
+                """, (referral_reward, referral_reward, referrer_id))
+
+                cur.execute("""
+                    INSERT INTO balance_history
+                    (user_id, admin_id, amount, operation, comment)
+                    VALUES (?, NULL, ?, 'referral', ?)
+                """, (
+                    referrer_id,
+                    referral_reward,
+                    f"Реферальное вознаграждение {REFERRAL_PERCENT:.0f}% с покупки пользователя {user_id}"
+                ))
+
         # История баланса
         cur.execute("""
             INSERT INTO balance_history
@@ -757,6 +869,24 @@ def buy_product(call):
         ),
         parse_mode="HTML"
     )
+
+
+    if referrer_id and referral_reward > 0:
+        try:
+            bot.send_message(
+                referrer_id,
+                (
+                    "💎 <b>Реферальное вознаграждение!</b>\n\n"
+                    "👤 Ваш реферал совершил покупку.\n"
+                    f"🛍 Товар: <b>{product['name']}</b>\n"
+                    f"💵 Сумма покупки: <b>{price:.2f} USDT</b>\n\n"
+                    f"➕ Вам начислено: <b>{referral_reward:.2f} USDT</b>\n"
+                    f"📊 Процент: <b>{REFERRAL_PERCENT:.0f}%</b>"
+                ),
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            print("Ошибка уведомления о реферальном начислении:", e)
 
 
 # ============================================================
@@ -829,6 +959,68 @@ def my_purchases(call):
         chat_id=call.message.chat.id,
         message_id=call.message.message_id,
         text=text,
+        parse_mode="HTML",
+        reply_markup=markup
+    )
+
+
+# ============================================================
+# REFERRAL PROGRAM
+# ============================================================
+
+@bot.callback_query_handler(
+    func=lambda call: call.data == "referral"
+)
+def referral_callback(call):
+
+    bot.answer_callback_query(call.id)
+    user_id = call.from_user.id
+
+    try:
+        bot_username = bot.get_me().username
+    except Exception as e:
+        print("Ошибка получения username бота:", e)
+        bot.send_message(call.message.chat.id, "❌ Не удалось создать реферальную ссылку.")
+        return
+
+    referral_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) AS count FROM users WHERE referrer_id = ?", (user_id,))
+    referrals_count = cur.fetchone()["count"]
+
+    cur.execute("SELECT referral_earnings, balance FROM users WHERE id = ?", (user_id,))
+    row = cur.fetchone()
+    referral_earnings = float(row["referral_earnings"] or 0) if row else 0.0
+    balance = float(row["balance"] or 0) if row else 0.0
+    conn.close()
+
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton(
+        "📤 Пригласить друга",
+        url=(
+            "https://t.me/share/url"
+            f"?url={referral_link}"
+            "&text=Присоединяйся к магазину!"
+        )
+    ))
+    markup.add(types.InlineKeyboardButton("◀️ Назад", callback_data="main_menu"))
+
+    bot.edit_message_text(
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        text=(
+            "👪 <b>Реферальная программа</b>\n\n"
+            f"💎 Вы получаете <b>{REFERRAL_PERCENT:.0f}%</b> с каждой покупки приглашённого пользователя.\n\n"
+            "🔗 <b>Ваша реферальная ссылка:</b>\n"
+            f"<code>{referral_link}</code>\n\n"
+            f"👥 Приглашено: <b>{referrals_count}</b>\n"
+            f"💰 Заработано: <b>{referral_earnings:.2f} USDT</b>\n"
+            f"💵 Текущий баланс: <b>{balance:.2f} USDT</b>\n\n"
+            "📌 Отправьте ссылку другу. Реферал закрепляется за вами один раз и навсегда."
+        ),
         parse_mode="HTML",
         reply_markup=markup
     )
@@ -1031,7 +1223,7 @@ def check_payment(call):
         return
 
     headers = {
-        "Crypto-Pay-API-Token": '626975:AAHcB3lBYupqGUO5duUonVBLuDzzb5oITAJ'
+        "Crypto-Pay-API-Token": CRYPTO_PAY_TOKEN
     }
 
     try:
@@ -1271,6 +1463,13 @@ def admin_menu(chat_id):
         types.InlineKeyboardButton(
             "📊 Статистика",
             callback_data="admin_stats"
+        )
+    )
+
+    markup.add(
+        types.InlineKeyboardButton(
+            "👪 Рефералы",
+            callback_data="admin_referrals"
         )
     )
     markup.add(
@@ -2384,100 +2583,419 @@ def process_admin_remove_balance(message):
 # ============================================================
 
 def create_database_report():
+    """Создаёт понятный и подробный TXT-отчёт по магазину."""
 
     conn = get_db()
     cur = conn.cursor()
 
+    def money(value):
+        return f"{float(value or 0):.2f} USDT"
+
+    def safe_name(value):
+        return str(value or "Без имени").replace("\n", " ").strip()
+
+    # ------------------------------------------------------------
+    # Пользователи
+    # ------------------------------------------------------------
     cur.execute("""
-        SELECT id, name, balance
+        SELECT id, name, balance, referrer_id, referral_earnings
         FROM users
         ORDER BY id ASC
     """)
-
     users = cur.fetchall()
 
+    # ------------------------------------------------------------
+    # Основные показатели
+    # ------------------------------------------------------------
+    cur.execute("SELECT COUNT(*) AS count FROM users")
+    total_users = cur.fetchone()["count"]
+
+    cur.execute("SELECT COUNT(*) AS count FROM users WHERE referrer_id IS NOT NULL")
+    total_referrals = cur.fetchone()["count"]
+
+    cur.execute("SELECT COALESCE(SUM(referral_earnings), 0) AS total FROM users")
+    total_referral_earnings = float(cur.fetchone()["total"] or 0)
+
+    cur.execute("SELECT COALESCE(SUM(balance), 0) AS total FROM users")
+    total_balances = float(cur.fetchone()["total"] or 0)
+
+    cur.execute("SELECT COUNT(*) AS count FROM purchases")
+    total_purchases = cur.fetchone()["count"]
+
+    cur.execute("SELECT COALESCE(SUM(price), 0) AS total FROM purchases")
+    total_sales = float(cur.fetchone()["total"] or 0)
+
+    cur.execute("SELECT COUNT(*) AS count FROM products WHERE active = 1")
+    active_products = cur.fetchone()["count"]
+
+    cur.execute("SELECT COUNT(*) AS count FROM stock WHERE sold = 0")
+    stock_left = cur.fetchone()["count"]
+
+    # ------------------------------------------------------------
+    # Выводы реферальных денег
+    # ------------------------------------------------------------
+    # Поддерживаем текущую таблицу referral_withdrawals, если она
+    # уже создана предыдущей версией бота. Ничего не ломаем, если
+    # таблицы ещё нет.
+    cur.execute("""
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'table' AND name = 'referral_withdrawals'
+    """)
+    withdrawals_table_exists = cur.fetchone() is not None
+
+    withdrawal_rows = []
+    total_withdrawn = 0.0
+    successful_withdrawn = 0.0
+    pending_withdrawn = 0.0
+    rejected_withdrawn = 0.0
+
+    if withdrawals_table_exists:
+        cur.execute("PRAGMA table_info(referral_withdrawals)")
+        withdrawal_columns = {
+            row["name"] for row in cur.fetchall()
+        }
+
+        # В разных версиях поля могли называться немного по-разному.
+        user_col = next(
+            (x for x in ("user_id", "telegram_id", "owner_id") if x in withdrawal_columns),
+            None
+        )
+        amount_col = next(
+            (x for x in ("amount", "sum", "value") if x in withdrawal_columns),
+            None
+        )
+        status_col = next(
+            (x for x in ("status", "state") if x in withdrawal_columns),
+            None
+        )
+        date_col = next(
+            (x for x in ("created_at", "date", "created", "timestamp") if x in withdrawal_columns),
+            None
+        )
+
+        if user_col and amount_col:
+            select_fields = [
+                f"w.{user_col} AS user_id",
+                f"w.{amount_col} AS amount"
+            ]
+
+            if status_col:
+                select_fields.append(f"w.{status_col} AS status")
+            else:
+                select_fields.append("NULL AS status")
+
+            if date_col:
+                select_fields.append(f"w.{date_col} AS created_at")
+            else:
+                select_fields.append("NULL AS created_at")
+
+            cur.execute(f"""
+                SELECT {', '.join(select_fields)},
+                       u.name AS user_name
+                FROM referral_withdrawals w
+                LEFT JOIN users u ON u.id = w.{user_col}
+                ORDER BY w.rowid DESC
+            """)
+
+            withdrawal_rows = cur.fetchall()
+
+            for row in withdrawal_rows:
+                amount = float(row["amount"] or 0)
+                status = str(row["status"] or "success").lower()
+
+                if status in ("success", "successful", "completed", "done", "paid", "approved"):
+                    successful_withdrawn += amount
+                elif status in ("pending", "processing", "new"):
+                    pending_withdrawn += amount
+                elif status in ("rejected", "failed", "cancelled", "canceled"):
+                    rejected_withdrawn += amount
+                else:
+                    successful_withdrawn += amount
+
+            total_withdrawn = successful_withdrawn
+
+    # ------------------------------------------------------------
+    # Красивый заголовок
+    # ------------------------------------------------------------
     report = []
 
-    report.append("=" * 60)
-    report.append("ОТЧЁТ ПО БАЗЕ ДАННЫХ МАГАЗИНА")
-    report.append("=" * 60)
+    report.extend([
+        "╔" + "═" * 68 + "╗",
+        "║" + " ОТЧЁТ ПО МАГАЗИНУ И РЕФЕРАЛЬНОЙ ПРОГРАММЕ ".center(68) + "║",
+        "╚" + "═" * 68 + "╝",
+        "",
+        "📌 СВОДКА",
+        "─" * 70,
+        f"👥 Пользователей                 : {total_users}",
+        f"🛍 Активных товаров              : {active_products}",
+        f"📦 Товаров на складе             : {stock_left}",
+        f"🛒 Всего покупок                 : {total_purchases}",
+        f"💵 Оборот                         : {money(total_sales)}",
+        f"💰 Балансы пользователей         : {money(total_balances)}",
+        "",
+        "👪 РЕФЕРАЛЬНАЯ ПРОГРАММА",
+        "─" * 70,
+        f"👥 Всего приглашённых            : {total_referrals}",
+        f"💎 Начислено реферерам           : {money(total_referral_earnings)}",
+        f"📈 Процент реферальной программы : {REFERRAL_PERCENT:.0f}%",
+        "",
+        "💸 ВЫВОДЫ РЕФЕРАЛЬНЫХ ДЕНЕГ",
+        "─" * 70,
+    ])
+
+    if withdrawals_table_exists:
+        report.extend([
+            f"💸 Успешно выведено              : {money(successful_withdrawn)}",
+            f"⏳ На проверке / в обработке     : {money(pending_withdrawn)}",
+            f"❌ Отклонено / неуспешно          : {money(rejected_withdrawn)}",
+            f"📋 Всего заявок                   : {len(withdrawal_rows)}",
+        ])
+    else:
+        report.append("⚠️ Таблица выводов ещё не создана.")
+
     report.append("")
 
-    report.append(
-        f"Всего пользователей: {len(users)}"
-    )
+    # ------------------------------------------------------------
+    # Рейтинг рефереров
+    # ------------------------------------------------------------
+    report.extend([
+        "🏆 РЕЙТИНГ РЕФЕРЕРОВ",
+        "─" * 70,
+    ])
 
-    report.append("")
+    cur.execute("""
+        SELECT
+            u.id,
+            u.name,
+            COALESCE(u.referral_earnings, 0) AS earnings,
+            COUNT(r.id) AS referral_count
+        FROM users u
+        LEFT JOIN users r ON r.referrer_id = u.id
+        GROUP BY u.id
+        HAVING referral_count > 0 OR earnings > 0
+        ORDER BY referral_count DESC, earnings DESC, u.id ASC
+    """)
+    referrers = cur.fetchall()
 
-    for user in users:
+    if not referrers:
+        report.append("📭 Рефералов пока нет.")
+    else:
+        for place, user in enumerate(referrers, 1):
+            report.extend([
+                "",
+                f"#{place}  {safe_name(user['name'])}",
+                f"     🆔 ID              : {user['id']}",
+                f"     👥 Приглашено      : {user['referral_count']}",
+                f"     💰 Заработано      : {money(user['earnings'])}",
+            ])
 
-        user_id = user["id"]
-        name = user["name"] or "Без имени"
-        balance = float(user["balance"] or 0)
+            # Сколько конкретно вывел этот реферер.
+            user_withdrawn = 0.0
+            user_withdrawal_count = 0
 
-        report.append("-" * 60)
-        report.append(f"ID: {user_id}")
-        report.append(f"Имя: {name}")
-        report.append(f"Баланс: {balance:.2f} USDT")
-        report.append("")
-
-        cur.execute("""
-            SELECT
-                purchases.id,
-                products.name,
-                purchases.price,
-                purchases.created_at
-            FROM purchases
-            LEFT JOIN products
-                ON products.id = purchases.product_id
-            WHERE purchases.user_id = ?
-            ORDER BY purchases.id DESC
-        """, (user_id,))
-
-        purchases = cur.fetchall()
-
-        if not purchases:
-
-            report.append("Покупки: нет")
-
-        else:
+            if withdrawals_table_exists and withdrawal_rows:
+                for withdrawal in withdrawal_rows:
+                    if withdrawal["user_id"] == user["id"]:
+                        status = str(withdrawal["status"] or "success").lower()
+                        if status in ("success", "successful", "completed", "done", "paid", "approved"):
+                            user_withdrawn += float(withdrawal["amount"] or 0)
+                            user_withdrawal_count += 1
 
             report.append(
-                f"Покупок: {len(purchases)}"
+                f"     💸 Выведено       : {money(user_withdrawn)}"
+            )
+            report.append(
+                f"     📤 Успешных выводов: {user_withdrawal_count}"
             )
 
-            report.append("")
+    # ------------------------------------------------------------
+    # Кто кого пригласил
+    # ------------------------------------------------------------
+    report.extend([
+        "",
+        "",
+        "👥 КТО КОГО ПРИГЛАСИЛ",
+        "─" * 70,
+    ])
 
-            for purchase in purchases:
+    cur.execute("""
+        SELECT
+            invited.id AS invited_id,
+            invited.name AS invited_name,
+            inviter.id AS inviter_id,
+            inviter.name AS inviter_name
+        FROM users invited
+        JOIN users inviter ON inviter.id = invited.referrer_id
+        ORDER BY inviter.id ASC, invited.id ASC
+    """)
+    pairs = cur.fetchall()
 
-                product_name = (
-                    purchase["name"]
-                    or "Удалённый товар"
-                )
+    if not pairs:
+        report.append("📭 Реферальных связей пока нет.")
+    else:
+        current_inviter = None
+        for pair in pairs:
+            if current_inviter != pair["inviter_id"]:
+                if current_inviter is not None:
+                    report.append("")
+                current_inviter = pair["inviter_id"]
+                report.extend([
+                    "",
+                    f"👑 {safe_name(pair['inviter_name'])}  |  ID: {pair['inviter_id']}",
+                    "   └─ Приглашённые:",
+                ])
 
+            report.append(
+                f"      → {safe_name(pair['invited_name'])}  |  ID: {pair['invited_id']}"
+            )
+
+    # ------------------------------------------------------------
+    # Полная история выводов
+    # ------------------------------------------------------------
+    report.extend([
+        "",
+        "",
+        "💸 ИСТОРИЯ ВЫВОДОВ РЕФЕРАЛЬНЫХ ДЕНЕГ",
+        "─" * 70,
+    ])
+
+    if not withdrawals_table_exists:
+        report.append("📭 История выводов отсутствует: таблица ещё не создана.")
+    elif not withdrawal_rows:
+        report.append("📭 Выводов пока не было.")
+    else:
+        for number, withdrawal in enumerate(withdrawal_rows, 1):
+            status_raw = str(withdrawal["status"] or "success").lower()
+
+            status_names = {
+                "success": "✅ Выполнен",
+                "successful": "✅ Выполнен",
+                "completed": "✅ Выполнен",
+                "done": "✅ Выполнен",
+                "paid": "✅ Выполнен",
+                "approved": "✅ Выполнен",
+                "pending": "⏳ В обработке",
+                "processing": "⏳ В обработке",
+                "new": "⏳ Новая заявка",
+                "rejected": "❌ Отклонён",
+                "failed": "❌ Ошибка",
+                "cancelled": "❌ Отменён",
+                "canceled": "❌ Отменён",
+            }
+
+            status = status_names.get(
+                status_raw,
+                f"ℹ️ {withdrawal['status'] or 'Выполнен'}"
+            )
+
+            report.extend([
+                "",
+                f"#{number}  {safe_name(withdrawal['user_name'])}",
+                f"     🆔 ID        : {withdrawal['user_id']}",
+                f"     💵 Сумма     : {money(withdrawal['amount'])}",
+                f"     📌 Статус    : {status}",
+                f"     🕐 Дата      : {withdrawal['created_at'] or 'Не указана'}",
+            ])
+
+    # ------------------------------------------------------------
+    # Пользователи
+    # ------------------------------------------------------------
+    report.extend([
+        "",
+        "",
+        "👤 ПОЛЬЗОВАТЕЛИ",
+        "─" * 70,
+    ])
+
+    for user in users:
+        user_id = user["id"]
+        name = safe_name(user["name"])
+
+        cur.execute(
+            "SELECT COUNT(*) AS count FROM users WHERE referrer_id = ?",
+            (user_id,)
+        )
+        invited_count = cur.fetchone()["count"]
+
+        report.extend([
+            "",
+            f"👤 {name}",
+            f"   🆔 ID                       : {user_id}",
+            f"   💰 Баланс                   : {money(user['balance'])}",
+            f"   💎 Заработано на рефералах : {money(user['referral_earnings'])}",
+            f"   👥 Приглашено               : {invited_count}",
+        ])
+
+        if user["referrer_id"]:
+            cur.execute(
+                "SELECT id, name FROM users WHERE id = ?",
+                (user["referrer_id"],)
+            )
+            inviter = cur.fetchone()
+            if inviter:
                 report.append(
-                    f"Покупка #{purchase['id']}"
+                    f"   👑 Пригласил               : {safe_name(inviter['name'])} (ID: {inviter['id']})"
                 )
-
+            else:
                 report.append(
-                    f"Товар: {product_name}"
+                    f"   👑 Пригласил               : ID {user['referrer_id']}"
                 )
+        else:
+            report.append("   👑 Пригласил               : —")
 
-                report.append(
-                    f"Цена: "
-                    f"{float(purchase['price']):.2f} USDT"
-                )
+    # ------------------------------------------------------------
+    # Покупки
+    # ------------------------------------------------------------
+    report.extend([
+        "",
+        "",
+        "🛒 ПОКУПКИ",
+        "─" * 70,
+    ])
 
-                report.append(
-                    f"Дата: {purchase['created_at']}"
-                )
+    cur.execute("""
+        SELECT
+            purchases.id,
+            purchases.user_id,
+            purchases.price,
+            purchases.created_at,
+            products.name AS product_name
+        FROM purchases
+        LEFT JOIN products ON products.id = purchases.product_id
+        ORDER BY purchases.id DESC
+    """)
+    purchases = cur.fetchall()
 
-                report.append("")
+    if not purchases:
+        report.append("📭 Покупок пока нет.")
+    else:
+        for purchase in purchases:
+            cur.execute(
+                "SELECT name FROM users WHERE id = ?",
+                (purchase["user_id"],)
+            )
+            buyer = cur.fetchone()
+            buyer_name = safe_name(buyer["name"]) if buyer else "Неизвестный пользователь"
 
-        report.append("")
+            report.extend([
+                "",
+                f"🛒 Покупка #{purchase['id']}",
+                f"   👤 Покупатель : {buyer_name} (ID: {purchase['user_id']})",
+                f"   📦 Товар      : {purchase['product_name'] or 'Удалённый товар'}",
+                f"   💵 Цена       : {money(purchase['price'])}",
+                f"   🕐 Дата       : {purchase['created_at']}",
+            ])
+
+    report.extend([
+        "",
+        "",
+        "═" * 70,
+        "КОНЕЦ ОТЧЁТА",
+        "═" * 70,
+    ])
 
     conn.close()
-
     return "\n".join(report)
 
 
@@ -2592,8 +3110,8 @@ def admin_stats(call):
                 file,
                 caption=(
                     "📄 <b>Отчёт по базе данных</b>\n\n"
-                    "Файл содержит ID пользователей, "
-                    "имена, балансы и историю покупок."
+                    "Файл содержит пользователей, покупки, балансы, "
+                    "рефералов, связи кто кого пригласил и заработок."
                 ),
                 parse_mode="HTML"
             )
@@ -2608,6 +3126,103 @@ def admin_stats(call):
         bot.send_message(
             call.message.chat.id,
             "❌ Не удалось создать отчёт."
+        )
+
+
+# ============================================================
+# ADMIN REFERRALS
+# ============================================================
+
+@bot.callback_query_handler(
+    func=lambda call: call.data == "admin_referrals"
+)
+def admin_referrals(call):
+
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "❌ Доступ запрещён.", show_alert=True)
+        return
+
+    bot.answer_callback_query(call.id)
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) AS count FROM users WHERE referrer_id IS NOT NULL")
+    total_referrals = cur.fetchone()["count"]
+
+    cur.execute("SELECT COALESCE(SUM(referral_earnings), 0) AS total FROM users")
+    total_earnings = float(cur.fetchone()["total"] or 0)
+
+    cur.execute("""
+        SELECT u.id, u.name, u.referral_earnings, COUNT(r.id) AS referral_count
+        FROM users u
+        LEFT JOIN users r ON r.referrer_id = u.id
+        GROUP BY u.id
+        HAVING referral_count > 0 OR u.referral_earnings > 0
+        ORDER BY referral_count DESC, u.referral_earnings DESC
+    """)
+    referrers = cur.fetchall()
+
+    text = (
+        "👪 <b>РЕФЕРАЛЬНАЯ СТАТИСТИКА</b>\n\n"
+        f"👥 Всего приглашено: <b>{total_referrals}</b>\n"
+        f"💰 Всего заработано: <b>{total_earnings:.2f} USDT</b>\n"
+        f"📈 Процент: <b>{REFERRAL_PERCENT:.0f}%</b>\n"
+    )
+
+    if referrers:
+        text += "\n━━━━━━━━━━━━━━━━━━\n👑 <b>РЕФЕРЕРЫ</b>\n━━━━━━━━━━━━━━━━━━\n"
+        for i, user in enumerate(referrers, 1):
+            text += (
+                f"\n<b>{i}. {user['name'] or 'Без имени'}</b>\n"
+                f"🆔 ID: <code>{user['id']}</code>\n"
+                f"👥 Пригласил: <b>{user['referral_count']}</b>\n"
+                f"💵 Заработал: <b>{float(user['referral_earnings'] or 0):.2f} USDT</b>\n"
+            )
+    else:
+        text += "\n📭 <b>Рефералов пока нет.</b>"
+
+    # Подробно: кто кого пригласил
+    cur.execute("""
+        SELECT invited.id AS invited_id, invited.name AS invited_name,
+               inviter.id AS inviter_id, inviter.name AS inviter_name
+        FROM users invited
+        JOIN users inviter ON inviter.id = invited.referrer_id
+        ORDER BY inviter.id ASC, invited.id ASC
+    """)
+    pairs = cur.fetchall()
+    conn.close()
+
+    if pairs:
+        text += "\n\n━━━━━━━━━━━━━━━━━━\n📋 <b>КТО КОГО ПРИГЛАСИЛ</b>\n━━━━━━━━━━━━━━━━━━\n"
+        for pair in pairs:
+            text += (
+                f"\n👤 <b>{pair['inviter_name'] or 'Без имени'}</b> "
+                f"(<code>{pair['inviter_id']}</code>)"
+                f"\n   ↳ {pair['invited_name'] or 'Без имени'} "
+                f"(<code>{pair['invited_id']}</code>)\n"
+            )
+
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("◀️ Назад", callback_data="admin_back"))
+
+    # Отправляем частями, если список большой.
+    chunks = []
+    remaining = text
+    while len(remaining) > 4000:
+        cut = remaining.rfind("\n", 0, 4000)
+        if cut < 100:
+            cut = 4000
+        chunks.append(remaining[:cut])
+        remaining = remaining[cut:]
+    chunks.append(remaining)
+
+    for i, chunk in enumerate(chunks):
+        bot.send_message(
+            call.message.chat.id,
+            chunk,
+            parse_mode="HTML",
+            reply_markup=markup if i == len(chunks) - 1 else None
         )
 
 
