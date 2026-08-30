@@ -2231,7 +2231,7 @@ def check_payment(call):
 
     headers = {
         "Crypto-Pay-API-Token":
-            CRYPTO_PAY_TOKEN
+            '626975:AAHcB3lBYupqGUO5duUonVBLuDzzb5oITAJ'
     }
 
     try:
