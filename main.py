@@ -19,7 +19,7 @@ from telebot import types
 # export BOT_TOKEN="..."
 # export CRYPTO_PAY_TOKEN="..."
 
-BOT_TOKEN = '8880021634:AAG1LMSMsax5XRFFHzgaeLIgJlXrMEoWc6s'
+BOT_TOKEN = '8880021634:AAHZjbNswiuap2nngedGYj4U7lzRqNdYT3M'
 CRYPTO_PAY_TOKEN = '626975:AAHcB3lBYupqGUO5duUonVBLuDzzb5oITAJ'
 
 if not BOT_TOKEN:
